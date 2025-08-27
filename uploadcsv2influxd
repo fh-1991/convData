@@ -1,0 +1,198 @@
+import os
+import glob
+import pandas as pd
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+# InfluxDB設定
+INFLUXDB_URL = "http://localhost:8086"
+INFLUXDB_TOKEN = "your-token"
+INFLUXDB_ORG = "your-org"
+INFLUXDB_BUCKET = "your-bucket"
+
+# CSVフォルダパス
+CSV_FOLDER = "/path/to/csv/folder"
+SCHEMA_FILE = "schema.xlsx"
+METADATA_FILE = "metadata.xlsx"  
+
+# バッチサイズ
+BATCH_SIZE = 5000
+
+def load_schema(schema_file):
+    """Excelファイルからスキーマ情報を読み込み"""
+    schema_df = pd.read_excel(schema_file)
+    schema = {}
+    for _, row in schema_df.iterrows():
+        col_name = row['カラム名']
+        col_type = row['型']
+        schema[col_name] = col_type
+    return schema
+
+def load_metadata(metadata_file):
+    """Excelファイルからメタデータ情報を読み込み"""
+    metadata_df = pd.read_excel(metadata_file)
+    metadata = {}
+    for _, row in metadata_df.iterrows():
+        seq_num = int(row['連番'])
+        metadata[seq_num] = {
+            '機種': str(row['機種']),
+            '番号': str(row['番号']),
+            '地区': str(row['地区']),
+            '部': str(row['部'])
+        }
+    return metadata
+
+def extract_sequence_from_filename(filename):
+    """ファイル名からアンダーバー区切りの2つ目を取得して整数化"""
+    try:
+        basename = os.path.basename(filename)
+        name_without_ext = os.path.splitext(basename)[0]
+        parts = name_without_ext.split('_')
+        if len(parts) >= 2:
+            return int(parts[1])
+        else:
+            print(f"Warning: Could not extract sequence from filename {filename}")
+            return None
+    except (ValueError, IndexError) as e:
+        print(f"Error extracting sequence from {filename}: {e}")
+        return None
+
+def convert_dataframe_types(df, schema):
+    """スキーマに基づいてDataFrameの型変換（スキーマカラムのみ抽出）"""
+    # スキーマに定義されたカラムのみを抽出
+    schema_columns = list(schema.keys())
+    available_columns = [col for col in schema_columns if col in df.columns]
+    
+    if not available_columns:
+        print("Warning: No schema columns found in CSV")
+        return pd.DataFrame()
+    
+    # スキーマカラムのみでDataFrameを作成
+    converted_df = df[available_columns].copy()
+    
+    # 型変換
+    for col_name, col_type in schema.items():
+        if col_name in converted_df.columns:
+            try:
+                if col_type == 'int':
+                    converted_df[col_name] = pd.to_numeric(converted_df[col_name], errors='coerce').astype('Int64')
+                elif col_type == 'float':
+                    converted_df[col_name] = pd.to_numeric(converted_df[col_name], errors='coerce').astype('float64')
+                elif col_type == 'str':
+                    converted_df[col_name] = converted_df[col_name].astype('string')
+            except Exception as e:
+                print(f"Warning: Failed to convert column {col_name} to {col_type}: {e}")
+    
+    missing_columns = set(schema_columns) - set(available_columns)
+    if missing_columns:
+        print(f"Info: Schema columns not found in CSV: {missing_columns}")
+    
+    return converted_df
+
+def csv_to_points(df, schema, file_metadata=None, measurement_name="data"):
+    """DataFrameをInfluxDBのPointsに変換（スキーマカラムのみ処理）"""
+    points = []
+    for _, row in df.iterrows():
+        point = Point(measurement_name)
+        
+        # タイムスタンプ列がある場合
+        if 'timestamp' in row:
+            point = point.time(row['timestamp'])
+        
+        # ファイルのメタデータをタグとして追加
+        if file_metadata:
+            for tag_name, tag_value in file_metadata.items():
+                point = point.tag(tag_name, tag_value)
+        
+        # スキーマに定義されたカラムのみを処理
+        for col_name, value in row.items():
+            if col_name == 'timestamp' or pd.isna(value):
+                continue
+            
+            # スキーマに定義されていないカラムはスキップ
+            if col_name not in schema:
+                continue
+                
+            col_type = schema[col_name]
+            
+            if col_type in ['int', 'float']:
+                # 数値型はfieldとして追加
+                point = point.field(col_name, value)
+            else:
+                # 文字列型はtagとして追加
+                point = point.tag(col_name, str(value))
+        
+        points.append(point)
+    return points
+
+def process_csv_files():
+    """CSVファイルを処理してInfluxDBに書き込み"""
+    # スキーマファイルを読み込み
+    print("Loading schema...")
+    schema = load_schema(SCHEMA_FILE)
+    print(f"Schema loaded: {schema}")
+    
+    # メタデータファイルを読み込み
+    print("Loading metadata...")
+    metadata = load_metadata(METADATA_FILE)
+    print(f"Metadata loaded for {len(metadata)} sequences")
+    
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+    
+    batch_points = []
+    processed_files = 0
+    total_records = 0
+    
+    # CSVファイルを順番に処理
+    csv_files = glob.glob(os.path.join(CSV_FOLDER, "*.csv"))
+    
+    for csv_file in csv_files:
+        try:
+            # ファイル名から連番を抽出
+            sequence_num = extract_sequence_from_filename(csv_file)
+            if sequence_num is None:
+                print(f"Skipping file {csv_file}: Could not extract sequence number")
+                continue
+            
+            # 連番に対応するメタデータを取得
+            file_metadata = metadata.get(sequence_num)
+            if file_metadata is None:
+                print(f"Warning: No metadata found for sequence {sequence_num} (file: {csv_file})")
+                file_metadata = {}
+            
+            # CSVファイル読み込み
+            df = pd.read_csv(csv_file)
+            
+            # スキーマに基づいて型変換
+            df_converted = convert_dataframe_types(df, schema)
+            
+            # DataFrameをPointsに変換（メタデータタグ付き）
+            points = csv_to_points(df_converted, schema, file_metadata)
+            batch_points.extend(points)
+            
+            processed_files += 1
+            total_records += len(df)
+            
+            # バッチサイズに達したら書き込み
+            if len(batch_points) >= BATCH_SIZE:
+                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=batch_points)
+                print(f"Wrote {len(batch_points)} records to InfluxDB")
+                batch_points = []
+            
+            if processed_files % 100 == 0:
+                print(f"Processed {processed_files} files, {total_records} records")
+                
+        except Exception as e:
+            print(f"Error processing {csv_file}: {e}")
+    
+    # 残りのレコードを書き込み
+    if batch_points:
+        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=batch_points)
+        print(f"Wrote final batch of {len(batch_points)} records to InfluxDB")
+    
+    client.close()
+    print(f"Completed: {processed_files} files processed, {total_records} total records")
+
+if __name__ == "__main__":
+    process_csv_files()
